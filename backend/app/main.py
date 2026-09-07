@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import admin, calculator, matches, performance, predictions
+from app.api.routes import admin, calculator, chat, matches, performance, predictions
 from app.core.cache import init_cache
 from app.core.config import settings
 from app.core.scheduler import start_scheduler, stop_scheduler
@@ -44,6 +44,7 @@ app.include_router(matches.router, prefix="/api/v1", tags=["matches"])
 app.include_router(predictions.router, prefix="/api/v1", tags=["predictions"])
 app.include_router(calculator.router, prefix="/api/v1", tags=["calculator"])
 app.include_router(performance.router, prefix="/api/v1", tags=["performance"])
+app.include_router(chat.router, prefix="/api/v1", tags=["chat"])
 app.include_router(admin.router, prefix="/api/v1")
 
 

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
 from app.core.config import settings
 from app.core.math_engine import (
+    Outcome as OutcomeType,
     bayesian_consensus,
     compute_match_edges,
+    is_btts_lucky_not_good,
+    resolve_away_xga,
+    xg_implied_probabilities,
 )
 from app.models.schemas import (
     LEAGUE_META,
@@ -24,8 +29,13 @@ from app.scrapers.prediction_sites import scrape_all_sources
 from app.services.odds_history_service import record_match_snapshot
 from app.services.odds_service import odds_client
 from app.services.performance_service import get_source_accuracies
+from app.services.standings_service import get_btts_rate, get_relegation_desperation_flag
+from app.services.understat_service import get_fixture_xg
 
 logger = logging.getLogger(__name__)
+
+XG_MODEL_SOURCE = "xg_model"
+XG_MODEL_WEIGHT = 0.40  # flat accuracy weight for the Poisson xG signal, between a weak and average tipster
 
 
 async def build_match_card(event: dict, league: LeagueKey, bankroll: float | None = None) -> MatchCard:
@@ -33,7 +43,10 @@ async def build_match_card(event: dict, league: LeagueKey, bankroll: float | Non
     away = event["away_team"]
     odds: MatchOdds = odds_client.parse_match_odds(event)
 
-    predictions = await scrape_all_sources(home, away, league)
+    predictions, xg = await asyncio.gather(
+        scrape_all_sources(home, away, league),
+        get_fixture_xg(home, away, league),
+    )
     accuracies = get_source_accuracies(league)
 
     source_probs: dict[str, dict[Outcome, float]] = {}
@@ -44,37 +57,67 @@ async def build_match_card(event: dict, league: LeagueKey, bankroll: float | Non
             "away": pred.away_prob,
         }
 
+    # Phase 2/4: blend a weak xG-implied signal in alongside the tipster
+    # sources. Rule: when the home side is relegation-desperate, use the
+    # away team's isolated away-venue xGA instead of their overall-form xGA.
+    home_desperation = get_relegation_desperation_flag(home, league)
+    away_isolated_xga = xg.away.isolated_away_xga if xg.away.isolated_away_xga is not None else xg.away.xga
+    resolved_away_xga = resolve_away_xga(
+        away_overall_xga=xg.away.xga,
+        away_isolated_xga=away_isolated_xga,
+        home_desperation_flag=home_desperation,
+    )
+    xg_probs = xg_implied_probabilities(
+        home_xg=xg.home.xg,
+        home_xga=xg.home.xga,
+        away_xg=xg.away.xg,
+        away_xga=resolved_away_xga,
+    )
+    source_probs[XG_MODEL_SOURCE] = xg_probs
+    accuracies[XG_MODEL_SOURCE] = XG_MODEL_WEIGHT
+    if home_desperation:
+        logger.info(
+            "%s vs %s (%s): home relegation-desperation flag set — away xGA input "
+            "switched from overall %.2f to away-venue-isolated %.2f",
+            home,
+            away,
+            league,
+            xg.away.xga,
+            resolved_away_xga,
+        )
+
+    # Phase 4: BTTS-rate-vs-xG "lucky, not good" Kelly penalty per side.
+    btts_penalty_outcomes: set[OutcomeType] = set()
+    if is_btts_lucky_not_good(get_btts_rate(home, league), xg.home.xg):
+        btts_penalty_outcomes.add("home")
+    if is_btts_lucky_not_good(get_btts_rate(away, league), xg.away.xg):
+        btts_penalty_outcomes.add("away")
+
     # Use multiplicative-devigged market as weak Bayesian prior
     from app.core.math_engine import multiplicative_devig
 
     prior_devig = multiplicative_devig(odds.best_home, odds.best_draw, odds.best_away)
     prior = {"home": prior_devig.home, "draw": prior_devig.draw, "away": prior_devig.away}
 
-    if not source_probs:
-        # All scrapers blocked/failed — degrade to market-implied probabilities only
+    if not predictions:
+        # All 5 tipster scrapers blocked/failed. source_probs still has the
+        # xg_model signal (it never fails to produce *something* — worst
+        # case, seeded demo xG), so this degrades to xG + market prior
+        # rather than a pure echo of the market, which is a strictly
+        # weaker fallback than what we now have available.
         logger.warning(
-            "No active prediction sources for %s vs %s (%s); using market prior alone",
+            "No active tipster sources for %s vs %s (%s); using xG signal + market prior",
             home,
             away,
             league,
         )
-        from app.core.math_engine import ConsensusResult
 
-        consensus = ConsensusResult(
-            home=prior["home"],
-            draw=prior["draw"],
-            away=prior["away"],
-            pick=max(prior, key=prior.get),  # type: ignore[arg-type]
-            confidence=0.0,
-            source_weights={},
-        )
-    else:
-        consensus = bayesian_consensus(
-            source_probs=source_probs,
-            source_accuracies={s: accuracies.get(s, 0.33) for s in source_probs},
-            prior=prior,
-            prior_strength=1.5,
-        )
+    consensus = bayesian_consensus(
+        source_probs=source_probs,
+        source_accuracies={s: accuracies.get(s, 0.33) for s in source_probs},
+        prior=prior,
+        prior_strength=1.5,
+    )
 
     pipeline = compute_match_edges(
         consensus=consensus,
@@ -86,6 +129,7 @@ async def build_match_card(event: dict, league: LeagueKey, bankroll: float | Non
         kelly_fraction=settings.default_kelly_fraction,
         bankroll=bankroll,
         devig_method="multiplicative",
+        btts_penalty_outcomes=btts_penalty_outcomes,
     )
 
     edges: list[EdgeMetrics] = []

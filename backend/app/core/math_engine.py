@@ -10,6 +10,7 @@ Implements:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -313,12 +314,24 @@ def compute_match_edges(
     kelly_fraction: float = 0.25,
     bankroll: float | None = None,
     devig_method: DevigMethod = "multiplicative",
+    *,
+    btts_penalty_outcomes: set[Outcome] | None = None,
 ) -> dict:
-    """Full pipeline: consensus vs bookie odds → EV + Kelly per outcome."""
+    """
+    Full pipeline: consensus vs bookie odds → EV + Kelly per outcome.
+
+    `btts_penalty_outcomes` (Phase 4 strategy rule) — the set of outcomes
+    ("home" and/or "away") whose backing team is flagged
+    `is_btts_lucky_not_good()`: high BTTS rate but low xG, i.e. probably
+    riding finishing variance rather than real attacking quality. Kelly for
+    those outcomes only is halved via `apply_strategy_penalties`; draw and
+    unflagged outcomes are untouched.
+    """
     home_o = bookie_odds["home"]
     draw_o = bookie_odds["draw"]
     away_o = bookie_odds["away"]
     fair = devig_odds(home_o, draw_o, away_o, method=devig_method)
+    penalized_outcomes = btts_penalty_outcomes or set()
 
     edges: dict[str, dict] = {}
     for outcome in ("home", "draw", "away"):
@@ -326,12 +339,16 @@ def compute_match_edges(
         odds = bookie_odds[outcome]  # type: ignore[index]
         ev = expected_value(p, odds)
         kelly = kelly_criterion(p, odds, fraction=kelly_fraction, bankroll=bankroll)
+        penalized = outcome in penalized_outcomes
+        if penalized:
+            kelly = apply_strategy_penalties(kelly, btts_lucky_not_good=True)
         edges[outcome] = {
             "probability": round(p, 6),
             "odds": odds,
             "fair_prob": fair.probability(outcome),  # type: ignore[arg-type]
             "ev": ev.as_dict(),
             "kelly": kelly.as_dict(),
+            "btts_penalty_applied": penalized,
         }
 
     best = max(edges.items(), key=lambda kv: kv[1]["ev"]["ev_pct"])
@@ -344,3 +361,224 @@ def compute_match_edges(
             **best[1],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — attacking-pressure & motivation signals
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AttackingPressure:
+    """Composite attacking-pressure score from shot & set-piece volume."""
+
+    team: str
+    pressure_score: float
+    avg_shots_on_target: float
+    avg_corners: float
+    components: dict[str, float]
+
+    def as_dict(self) -> dict:
+        return {
+            "team": self.team,
+            "pressure_score": self.pressure_score,
+            "avg_shots_on_target": self.avg_shots_on_target,
+            "avg_corners": self.avg_corners,
+            "components": self.components,
+        }
+
+
+def calculate_attacking_pressure(
+    avg_shots_on_target: float,
+    avg_corners: float,
+    *,
+    team: str = "",
+    shots_on_target_weight: float = 0.65,
+    corners_weight: float = 0.35,
+    shots_on_target_baseline: float = 4.5,
+    corners_baseline: float = 5.0,
+) -> AttackingPressure:
+    """
+    Composite "attacking pressure" score from shot & set-piece volume.
+
+    Currently fed simulated per-fixture data (see
+    `app.services.understat_service._seeded_xg`, which already generates a
+    plausible shots-on-target/corners pair per fixture in demo mode) — it's
+    written to take a real per-90 trailing-average payload from a stats
+    provider (e.g. FootyStats) as a drop-in replacement for the two inputs;
+    nothing else about the call site needs to change.
+
+    Each input is expressed as a percentage of a league-average baseline
+    (`*_baseline`, tune per league/season), weighted, and summed — so 100 =
+    exactly average attacking pressure, >100 = above average, <100 = below.
+    """
+    if avg_shots_on_target < 0 or avg_corners < 0:
+        raise ValueError("avg_shots_on_target and avg_corners must be non-negative")
+    if shots_on_target_baseline <= 0 or corners_baseline <= 0:
+        raise ValueError("baselines must be positive")
+    if abs((shots_on_target_weight + corners_weight) - 1.0) > 1e-9:
+        raise ValueError("shots_on_target_weight + corners_weight must sum to 1.0")
+
+    sot_index = (avg_shots_on_target / shots_on_target_baseline) * 100.0
+    corners_index = (avg_corners / corners_baseline) * 100.0
+    pressure_score = shots_on_target_weight * sot_index + corners_weight * corners_index
+
+    return AttackingPressure(
+        team=team,
+        pressure_score=round(pressure_score, 2),
+        avg_shots_on_target=round(avg_shots_on_target, 2),
+        avg_corners=round(avg_corners, 2),
+        components={
+            "shots_on_target_index": round(sot_index, 2),
+            "corners_index": round(corners_index, 2),
+        },
+    )
+
+
+def flag_relegation_desperation(
+    team_points: int,
+    relegation_zone_points: int,
+    matches_played: int,
+    total_matches_in_season: int,
+) -> bool:
+    """
+    "Motivation / desperation" flag: True when a team sits at most 5 points
+    above the relegation-zone cutoff AND the season is more than 65% played
+    (late enough that survival pressure is real, without requiring the
+    season to already be over).
+
+    `relegation_zone_points` should be the points total of the last
+    non-relegation ("safe") table position — pass whatever your standings
+    source uses consistently (see `app.services.standings_service`).
+    """
+    if total_matches_in_season <= 0:
+        raise ValueError("total_matches_in_season must be positive")
+    if matches_played < 0:
+        raise ValueError("matches_played must be non-negative")
+
+    season_pct_complete = matches_played / total_matches_in_season
+    points_above_zone = team_points - relegation_zone_points
+    return points_above_zone <= 5 and season_pct_complete > 0.65
+
+
+def resolve_away_xga(
+    away_overall_xga: float,
+    away_isolated_xga: float,
+    *,
+    home_desperation_flag: bool,
+) -> float:
+    """
+    Phase 4 strategy rule: when the home side is relegation-desperate
+    (`flag_relegation_desperation` is True for them), a desperate home team
+    is argued to raise its press/attacking intensity specifically at home —
+    so the away team's blended overall-form xGA is a weaker signal here
+    than how they specifically perform *away*. In that case, ignore overall
+    form and use only the away-venue-isolated xGA; otherwise use overall.
+    """
+    return away_isolated_xga if home_desperation_flag else away_overall_xga
+
+
+def xg_implied_probabilities(
+    home_xg: float,
+    home_xga: float,
+    away_xg: float,
+    away_xga: float,
+    *,
+    home_advantage: float = 1.1,
+    max_goals: int = 8,
+) -> dict[Outcome, float]:
+    """
+    Lightweight independent-Poisson W/D/L distribution from expected goals.
+
+    This is a weak *additional* signal meant to be blended into
+    `bayesian_consensus`'s `source_probs` alongside tipster sources (e.g.
+    under a synthetic source key like "xg_model") — not a replacement for
+    the tipster/market consensus.
+
+    `away_xga` is whatever `resolve_away_xga()` decided to use for this
+    fixture (overall vs. isolated-away, per the motivation-flag rule).
+    """
+    if home_xg < 0 or home_xga < 0 or away_xg < 0 or away_xga < 0:
+        raise ValueError("xG/xGA inputs must be non-negative")
+    if max_goals < 1:
+        raise ValueError("max_goals must be >= 1")
+
+    # Each side's expected goals = average of their own attack and the
+    # opponent's defensive leakiness, with a home-advantage multiplier.
+    home_expected = ((home_xg + away_xga) / 2.0) * home_advantage
+    away_expected = (away_xg + home_xga) / 2.0
+    home_expected = max(home_expected, 1e-6)
+    away_expected = max(away_expected, 1e-6)
+
+    goals = np.arange(0, max_goals + 1)
+    factorials = np.array([math.factorial(int(g)) for g in goals], dtype=float)
+    home_pmf = np.exp(-home_expected) * home_expected**goals / factorials
+    away_pmf = np.exp(-away_expected) * away_expected**goals / factorials
+
+    score_matrix = np.outer(home_pmf, away_pmf)  # [home_goals, away_goals]
+    p_home = float(np.tril(score_matrix, k=-1).sum())
+    p_draw = float(np.trace(score_matrix))
+    p_away = float(np.triu(score_matrix, k=1).sum())
+
+    total = p_home + p_draw + p_away
+    if total <= 0:
+        return {"home": 1 / 3, "draw": 1 / 3, "away": 1 / 3}
+    return {"home": p_home / total, "draw": p_draw / total, "away": p_away / total}
+
+
+def is_btts_lucky_not_good(
+    btts_rate: float,
+    xg: float,
+    *,
+    btts_threshold: float = 0.60,
+    xg_threshold: float = 1.0,
+) -> bool:
+    """
+    Phase 4 strategy rule: True when a team's BTTS (both-teams-to-score)
+    rate is high (>60%) despite low underlying xG (<1.0) — a sign the goals
+    they're involved in are driven by finishing/defensive variance rather
+    than real attacking or defensive quality, i.e. "lucky, not good".
+    """
+    if not 0.0 <= btts_rate <= 1.0:
+        raise ValueError("btts_rate must be in [0, 1]")
+    if xg < 0:
+        raise ValueError("xg must be non-negative")
+    return btts_rate > btts_threshold and xg < xg_threshold
+
+
+def apply_strategy_penalties(
+    kelly: KellyResult,
+    *,
+    btts_lucky_not_good: bool = False,
+    penalty_multiplier: float = 0.5,
+) -> KellyResult:
+    """
+    Apply Phase 4 strategy penalty modifiers to an already-computed Kelly
+    stake. Returns a new (frozen) KellyResult rather than mutating `kelly`.
+
+    Currently implements the BTTS-lucky-not-good penalty
+    (`is_btts_lucky_not_good`): halves the recommended stake. `full_kelly`
+    and `edge` are left as-is (they describe the raw mathematical edge);
+    only the *recommended* stake fields are scaled, so the penalty is
+    visibly a staking-discipline override, not a claim that the edge itself
+    changed.
+    """
+    if not btts_lucky_not_good:
+        return kelly
+    if not 0.0 < penalty_multiplier <= 1.0:
+        raise ValueError("penalty_multiplier must be in (0, 1]")
+
+    frac = kelly.fractional_kelly * penalty_multiplier
+    stake_amount = (
+        round(kelly.recommended_stake_amount * penalty_multiplier, 2)
+        if kelly.recommended_stake_amount is not None
+        else None
+    )
+    return KellyResult(
+        full_kelly=kelly.full_kelly,
+        fractional_kelly=round(frac, 6),
+        fraction_used=kelly.fraction_used,
+        edge=kelly.edge,
+        recommended_stake_pct=round(frac * 100.0, 4),
+        recommended_stake_amount=stake_amount,
+    )

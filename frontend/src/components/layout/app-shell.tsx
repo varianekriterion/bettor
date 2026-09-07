@@ -9,6 +9,7 @@ import {
   LayoutDashboard,
   Radar,
 } from "lucide-react";
+import { ChatDrawer } from "@/components/chat/chat-drawer";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -111,6 +112,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <main className="flex-1 px-4 py-6 md:px-8 md:py-8">{children}</main>
         </div>
       </div>
+      <ChatDrawer />
     </div>
   );
 }

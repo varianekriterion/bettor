@@ -35,6 +35,21 @@ async def _run_scheduled_sync() -> None:
         logger.exception("Scheduled sync_league_predictions crashed")
 
 
+async def _run_scheduled_bet_memory_embed() -> None:
+    from app.services.embedding_service import backfill_bet_memory
+
+    try:
+        result = await backfill_bet_memory(trigger="scheduler")
+        logger.info(
+            "Scheduled bet-memory embed complete: candidates=%d embedded=%d ok=%s",
+            result.candidates,
+            result.embedded,
+            result.ok,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Scheduled backfill_bet_memory crashed")
+
+
 def start_scheduler() -> AsyncIOScheduler | None:
     """Start the 30-minute sync_league_predictions job."""
     global _scheduler
@@ -57,10 +72,23 @@ def start_scheduler() -> AsyncIOScheduler | None:
         coalesce=True,
         misfire_grace_time=120,
     )
+    _scheduler.add_job(
+        _run_scheduled_bet_memory_embed,
+        trigger=IntervalTrigger(minutes=settings.bet_memory_embed_interval_minutes),
+        id="backfill_bet_memory",
+        name="backfill_bet_memory",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=120,
+    )
+
     _scheduler.start()
     logger.info(
-        "APScheduler started — sync_league_predictions every %d minutes",
+        "APScheduler started — sync_league_predictions every %d minutes, "
+        "backfill_bet_memory every %d minutes",
         settings.sync_interval_minutes,
+        settings.bet_memory_embed_interval_minutes,
     )
 
     if settings.sync_on_startup:

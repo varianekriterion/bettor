@@ -45,6 +45,19 @@ class Settings(BaseSettings):
         "soccer_uefa_europa_league",
     ]
 
+    # --- AI / RAG (Phase 1 & 3) ---
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+    openai_embedding_dims: int = 1536
+    openai_chat_model: str = "gpt-4o-mini"
+
+    # --- Understat xG/xGA (Phase 2) ---
+    understat_season: str = "2025"
+
+    # --- Bet-memory embedding background job (Phase 1) ---
+    bet_memory_embed_interval_minutes: int = 15
+    bet_memory_batch_size: int = 50
+
 
 @lru_cache
 def get_settings() -> Settings:

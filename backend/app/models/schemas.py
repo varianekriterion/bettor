@@ -157,6 +157,7 @@ class EdgeMetrics(BaseModel):
     ev_pct: float
     kelly_pct: float
     is_positive_ev: bool
+    btts_penalty_applied: bool = False
 
 
 class MatchCard(BaseModel):
@@ -191,6 +192,34 @@ class CalculatorResponse(BaseModel):
     expected_return: float
     edge: float
     kelly_fraction_used: float
+
+
+class XGStats(BaseModel):
+    """Understat expected-goals profile for one side in a single fixture."""
+
+    team: str
+    xg: float = Field(ge=0, description="Expected goals for, this fixture (or trailing avg)")
+    xga: float = Field(ge=0, description="Expected goals against, this fixture (or trailing avg)")
+    shots_on_target: float | None = Field(default=None, ge=0, description="Simulated pending FootyStats")
+    corners: float | None = Field(default=None, ge=0, description="Simulated pending FootyStats")
+    isolated_away_xga: float | None = Field(
+        default=None,
+        ge=0,
+        description="Away-venue-only trailing xGA (only set for the away side); "
+        "used instead of overall xga when the home team is relegation-desperate.",
+    )
+    matches_sampled: int = Field(default=1, ge=1)
+    source: Literal["understat", "demo"] = "understat"
+
+
+class FixtureXGStats(BaseModel):
+    """xG/xGA for both sides of one fixture, as consumed by math_engine + chat tools."""
+
+    home: XGStats
+    away: XGStats
+    league: LeagueKey
+    season: str
+    fetched_at: datetime
 
 
 class SourcePerformance(BaseModel):

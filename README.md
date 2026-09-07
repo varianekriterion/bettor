@@ -36,6 +36,7 @@ cd backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install --no-deps understat==0.1.14  # see requirements.txt note: its packaging wrongly pins pytest as a runtime dep
 cp .env.example .env
 python run.py
 ```
