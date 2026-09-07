@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.next/
+out/
+dist/
+build/
+*.egg-info/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+backend/.env
+*.pem
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs / coverage
+*.log
+coverage/
+htmlcov/
+.coverage
+
+# Playwright
+backend/playwright-report/
+backend/test-results/
