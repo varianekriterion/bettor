@@ -16,12 +16,20 @@ async def list_matches(
     league: LeagueKey | None = Query(default=None),
     positive_ev_only: bool = Query(default=False),
     bankroll: float | None = Query(default=None, gt=0),
+    days_ahead: int = Query(
+        default=0,
+        ge=0,
+        le=30,
+        description="Only fixtures in the next N days (UTC). 0 = use server default.",
+    ),
 ) -> list[MatchCard]:
     """Live match feed with consensus picks, EV%, and Kelly stake suggestions."""
+    window = days_ahead if days_ahead > 0 else None
     return await get_live_matches(
         league=league,
         positive_ev_only=positive_ev_only,
         bankroll=bankroll,
+        days_ahead=window,
     )
 
 

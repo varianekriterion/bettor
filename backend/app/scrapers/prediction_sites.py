@@ -212,6 +212,9 @@ async def scrape_all_sources(
     Run all scrapers concurrently.
     Failed / blocked sources are skipped so Bayesian consensus uses remaining active sources.
     """
+    if not settings.use_demo_data and not settings.use_live_scrapers:
+        return []
+
     import asyncio
 
     results = await asyncio.gather(

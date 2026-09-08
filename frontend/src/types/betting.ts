@@ -194,6 +194,9 @@ export interface BetJournalEntry {
   result: "win" | "loss" | "push" | "pending";
   profit?: number | null;
   placed_at: string;
+  ocr_applied?: boolean;
+  ocr_market?: string | null;
+  ocr_bookmaker?: string | null;
 }
 
 export type BetResult = BetJournalEntry["result"];

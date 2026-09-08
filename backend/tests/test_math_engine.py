@@ -7,12 +7,15 @@ import math
 import pytest
 
 from app.core.math_engine import (
+    adaptive_prior_strength,
     bayesian_consensus,
+    compute_match_edges,
     expected_value,
     implied_probability,
     kelly_criterion,
     multiplicative_devig,
     power_devig,
+    qualifies_for_positive_ev,
 )
 
 
@@ -72,3 +75,69 @@ def test_bayesian_consensus_pick():
     assert result.pick == "home"
     assert math.isclose(result.home + result.draw + result.away, 1.0, abs_tol=1e-6)
     assert abs(sum(result.source_weights.values()) - 1.0) < 1e-6
+
+
+def test_longshot_ev_guardrails_reject_unrealistic_edge():
+    # Noisy 14% on a 25.00 longshot → raw EV ~250%, not actionable
+    ev = expected_value(0.14, 25.0)
+    assert ev.raw_ev_pct == pytest.approx(250.0)
+    assert ev.ev_pct == pytest.approx(25.0)
+    assert ev.is_anomaly is True
+    assert ev.is_positive is False
+    assert ev.anomaly_reason == "High-Variance Outlier / Anomaly"
+
+
+def test_longshot_odds_and_probability_filters():
+    assert qualifies_for_positive_ev(0.15, 8.0, 5.0) is False  # odds > 7.50
+    assert qualifies_for_positive_ev(0.10, 6.0, 5.0) is False  # prob < 0.12
+    assert qualifies_for_positive_ev(0.20, 5.0, 10.0) is True
+
+
+def test_adaptive_prior_shrinkage_on_extreme_longshot():
+    market_prior = {"home": 0.70, "draw": 0.20, "away": 0.04}
+    strengths = adaptive_prior_strength(market_prior)
+    assert strengths["away"] > strengths["home"]
+
+    noisy_sources = {
+        "tipster_a": {"home": 0.30, "draw": 0.20, "away": 0.50},
+        "tipster_b": {"home": 0.25, "draw": 0.20, "away": 0.55},
+    }
+    flat = bayesian_consensus(
+        noisy_sources,
+        prior=market_prior,
+        prior_strength=1.5,
+    )
+    shrunk = bayesian_consensus(
+        noisy_sources,
+        prior=market_prior,
+        prior_strength=adaptive_prior_strength(market_prior),
+    )
+    assert shrunk.away < flat.away
+    assert shrunk.away < 0.14
+
+
+def test_kelly_high_odds_uses_eighth_kelly_and_cap():
+    # p=0.25, odds=6.0 → full Kelly = (5*0.25 - 0.75)/5 = 0.1, eighth = 0.0125
+    k = kelly_criterion(0.25, 6.0, fraction=0.25, bankroll=1000)
+    assert k.fraction_used == pytest.approx(0.125)
+    # 1.25% stake exceeds the 0.5% longshot cap
+    assert k.recommended_stake_pct == pytest.approx(0.5)
+    assert k.fractional_kelly == pytest.approx(0.005)
+
+    # Very large edge at high odds should still cap at 0.5%
+    k_cap = kelly_criterion(0.40, 10.0, fraction=0.25, bankroll=1000)
+    assert k_cap.recommended_stake_pct == pytest.approx(0.5)
+
+
+def test_compute_match_edges_prefers_actionable_best_bet():
+    consensus = bayesian_consensus(
+        {"src": {"home": 0.55, "draw": 0.25, "away": 0.20}},
+        prior={"home": 0.45, "draw": 0.28, "away": 0.27},
+        prior_strength=1.5,
+    )
+    pipeline = compute_match_edges(
+        consensus=consensus,
+        bookie_odds={"home": 2.10, "draw": 3.40, "away": 25.0},
+    )
+    assert pipeline["best_bet"]["outcome"] == "home"
+    assert pipeline["edges"]["away"]["ev"]["is_positive"] is False

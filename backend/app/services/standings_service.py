@@ -1,108 +1,146 @@
 """
-Seeded league-standings + team-form context for the Phase 2/4 strategy
-rules (relegation-desperation flag, BTTS-rate penalty). Same "demo seed,
-replace with real rollups later" philosophy as
-`app.services.performance_service` — see its module docstring note about
-replacing seeds with Supabase rollups once match results are settled.
+League-standings + team-form context for Phase 2/4 strategy rules
+(relegation-desperation flag, BTTS-rate penalty).
 
-Cup competitions (UCL/UEL) aren't a relegation format, so standings context
-is always None / the desperation flag is always False for them.
+Standings are fetched live from football-data.org v4 when
+``settings.football_data_api_key`` is set; otherwise the desperation
+flag falls back to neutral defaults. BTTS rates remain seeded until a
+real rollup source is wired (Step 4).
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
+import httpx
+
+from app.core.config import settings
 from app.core.math_engine import flag_relegation_desperation
 from app.models.schemas import LeagueKey
 
-# Total league matches per season — used to compute "season % complete".
-# 0 marks a non-relegation (cup) competition.
-TOTAL_MATCHES_IN_SEASON: dict[str, int] = {
-    "epl": 38,
-    "laliga": 38,
-    "seriea": 38,
-    "bundesliga": 34,
-    "ucl": 0,
-    "uel": 0,
+# Mapping Bettor internal league codes to Football-Data.org codes
+LEAGUE_CODE_MAP: dict[str, str] = {
+    "epl": "PL",
+    "laliga": "PD",
+    "bundesliga": "BL1",
+    "seriea": "SA",
+    "ucl": "CL",
+    "uel": "EL",
 }
 
-# Points total of the last "safe" (non-relegation-zone) table position —
-# the cutoff each team's points are compared against.
-RELEGATION_CUTOFF_SEED: dict[str, int] = {
-    "epl": 34,
-    "laliga": 36,
-    "seriea": 34,
-    "bundesliga": 30,
-}
+# In-memory cache so we never spam the free tier rate limit
+_STANDINGS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-@dataclass(frozen=True)
-class StandingsContext:
-    team: str
-    league: str
-    points: int
-    matches_played: int
-    relegation_zone_points: int
-    total_matches_in_season: int
-
-
-def _seeded_standings(team: str, league: str) -> StandingsContext:
-    """Deterministic pseudo-standings, stable across restarts."""
-    digest = hashlib.sha256(f"standings|{league}|{team}".encode()).hexdigest()
-    total = TOTAL_MATCHES_IN_SEASON.get(league, 38)
-    # ~68-98% of the season played — biased late so the flag is exercisable in demo mode.
-    played_frac = 0.68 + (int(digest[0:2], 16) / 255.0) * 0.30
-    matches_played = min(round(total * played_frac), total)
-
-    cutoff = RELEGATION_CUTOFF_SEED.get(league, 34)
-    # Spread points from ~6 below to ~18 above the cutoff, so the seed mixes
-    # comfortably-safe / borderline / genuinely-battling teams.
-    points_delta = round((int(digest[2:4], 16) / 255.0) * 24 - 6)
-    points = max(0, cutoff + points_delta)
-
-    return StandingsContext(
-        team=team,
-        league=league,
-        points=points,
-        matches_played=matches_played,
-        relegation_zone_points=cutoff,
-        total_matches_in_season=total,
-    )
-
-
-def get_standings_context(team: str, league: LeagueKey | str) -> StandingsContext | None:
-    """None for cup competitions (ucl/uel), where relegation doesn't apply."""
-    league_str = str(league)
-    if TOTAL_MATCHES_IN_SEASON.get(league_str, 0) <= 0:
+async def get_real_league_standings(league_code: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches real standings from football-data.org v4.
+    Caches in-memory to prevent rate-limit throttling (10 requests/min).
+    """
+    api_code = LEAGUE_CODE_MAP.get(league_code.lower())
+    if not api_code:
         return None
-    return _seeded_standings(team, league_str)
+
+    if api_code in _STANDINGS_CACHE:
+        return _STANDINGS_CACHE[api_code]
+
+    if not settings.football_data_api_key:
+        return None
+
+    url = f"https://api.football-data.org/v4/competitions/{api_code}/standings"
+    headers = {"X-Auth-Token": settings.football_data_api_key}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                _STANDINGS_CACHE[api_code] = data
+                return data
+            print(f"[StandingsService] Error {resp.status_code}: {resp.text}")
+            return None
+    except Exception as e:
+        print(f"[StandingsService] Failed to fetch live standings: {e}")
+        return None
 
 
-def get_relegation_desperation_flag(team: str, league: LeagueKey | str) -> bool:
-    """Wraps `math_engine.flag_relegation_desperation` with seeded standings."""
-    ctx = get_standings_context(team, league)
-    if ctx is None:
+async def get_team_table_context(league_code: str, team_name: str) -> Dict[str, Any]:
+    """
+    Returns points, position, relegation line delta, and matches played
+    to accurately feed the Desperation / Motivation factor in math_engine.py.
+    """
+    data = await get_real_league_standings(league_code)
+    if not data or "standings" not in data:
+        return {
+            "position": 10,
+            "points": 40,
+            "points_to_relegation": 15,
+            "season_completion": 0.5,
+        }
+
+    table = data["standings"][0]["table"]
+    total_teams = len(table)
+    relegation_cutoff_idx = total_teams - 3
+    relegation_threshold_points = table[relegation_cutoff_idx]["points"]
+    total_season_games = (total_teams - 1) * 2
+
+    for row in table:
+        if team_name.lower() in row["team"]["name"].lower():
+            points = row["points"]
+            played = row["playedGames"]
+            season_completion = played / total_season_games if total_season_games else 0.5
+
+            return {
+                "position": row["position"],
+                "points": points,
+                "points_to_relegation": points - relegation_threshold_points,
+                "season_completion": season_completion,
+                "goal_difference": row["goalDifference"],
+                "matches_played": played,
+                "total_matches_in_season": total_season_games,
+            }
+
+    return {
+        "position": 10,
+        "points": 40,
+        "points_to_relegation": 15,
+        "season_completion": 0.5,
+    }
+
+
+async def get_relegation_desperation_flag(team: str, league: LeagueKey | str) -> bool:
+    """Wraps ``math_engine.flag_relegation_desperation`` with live standings."""
+    league_str = str(league)
+    if league_str in ("ucl", "uel"):
         return False
+
+    ctx = await get_team_table_context(league_str, team)
+    relegation_zone_points = ctx["points"] - ctx["points_to_relegation"]
+    matches_played = ctx.get("matches_played")
+    total_matches = ctx.get("total_matches_in_season")
+
+    if matches_played is None or total_matches is None:
+        total_matches = 38
+        matches_played = round(ctx["season_completion"] * total_matches)
+
     return flag_relegation_desperation(
-        team_points=ctx.points,
-        relegation_zone_points=ctx.relegation_zone_points,
-        matches_played=ctx.matches_played,
-        total_matches_in_season=ctx.total_matches_in_season,
+        team_points=ctx["points"],
+        relegation_zone_points=relegation_zone_points,
+        matches_played=matches_played,
+        total_matches_in_season=total_matches,
     )
 
 
 def _seeded_btts_rate(team: str, league: str) -> float:
     digest = hashlib.sha256(f"btts|{league}|{team}".encode()).hexdigest()
-    return round(0.35 + (int(digest[0:2], 16) / 255.0) * 0.45, 3)  # ~0.35-0.80
+    return round(0.35 + (int(digest[0:2], 16) / 255.0) * 0.45, 3)
 
 
 def get_btts_rate(team: str, league: LeagueKey | str) -> float:
     """
-    Seeded both-teams-to-score rate for `is_btts_lucky_not_good()`.
-    Replace with a real rollup (e.g. FootyStats, or our own settled-match
-    history) once available — same seed-then-swap pattern as
-    `performance_service._PERFORMANCE_SEED`.
+    Seeded both-teams-to-score rate for ``is_btts_lucky_not_good()``.
+    Replace with a real rollup once available — same seed-then-swap pattern
+    as ``performance_service._PERFORMANCE_SEED``.
     """
     return _seeded_btts_rate(team, str(league))

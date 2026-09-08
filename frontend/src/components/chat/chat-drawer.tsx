@@ -13,7 +13,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
-import { ensureJournalSession } from "@/lib/supabase";
+import { useAuth } from "@/contexts/auth-context";
 import { streamChat, type ChatMessage } from "@/lib/chat";
 import { cn } from "@/lib/utils";
 
@@ -29,27 +29,19 @@ interface DisplayMessage extends ChatMessage {
 }
 
 export function ChatDrawer() {
+  const { user } = useAuth();
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [userId, setUserId] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Resolve (or anonymously create) a Supabase session lazily on first open,
-  // so search_past_bet_mistakes can be scoped to this user's journal — same
-  // auth flow the bet journal already uses (see lib/supabase.ts).
-  useEffect(() => {
-    if (open && userId === null) {
-      ensureJournalSession()
-        .then((session) => setUserId(session.userId))
-        .catch(() => setUserId(null));
-    }
-  }, [open, userId]);
+  // Scope bet-memory tool calls to the signed-in user's journal rows.
+  const userId = user?.id ?? null;
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });

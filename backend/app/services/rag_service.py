@@ -11,24 +11,23 @@ intentionally isn't in this file.
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 from typing import Any
 
-from app.core.config import settings
+from app.core.config import get_settings
 from app.services.supabase_store import get_supabase_client
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache
 def get_openai_client():
     """Return an AsyncOpenAI client, or None if no API key is configured."""
-    if not settings.openai_api_key:
+    key = get_settings().openai_api_key
+    if not key:
         return None
     try:
         from openai import AsyncOpenAI
 
-        return AsyncOpenAI(api_key=settings.openai_api_key)
+        return AsyncOpenAI(api_key=key)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to init OpenAI client: %s", exc)
         return None
@@ -42,9 +41,9 @@ async def embed_text(text: str) -> list[float] | None:
         return None
     try:
         resp = await client.embeddings.create(
-            model=settings.openai_embedding_model,
+            model=get_settings().openai_embedding_model,
             input=text,
-            dimensions=settings.openai_embedding_dims,
+            dimensions=get_settings().openai_embedding_dims,
         )
         return resp.data[0].embedding
     except Exception as exc:  # noqa: BLE001

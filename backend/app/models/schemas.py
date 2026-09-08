@@ -158,6 +158,9 @@ class EdgeMetrics(BaseModel):
     kelly_pct: float
     is_positive_ev: bool
     btts_penalty_applied: bool = False
+    raw_ev_pct: float | None = None
+    is_ev_anomaly: bool = False
+    ev_anomaly_reason: str | None = None
 
 
 class MatchCard(BaseModel):
@@ -200,8 +203,8 @@ class XGStats(BaseModel):
     team: str
     xg: float = Field(ge=0, description="Expected goals for, this fixture (or trailing avg)")
     xga: float = Field(ge=0, description="Expected goals against, this fixture (or trailing avg)")
-    shots_on_target: float | None = Field(default=None, ge=0, description="Simulated pending FootyStats")
-    corners: float | None = Field(default=None, ge=0, description="Simulated pending FootyStats")
+    shots_on_target: float | None = Field(default=None, ge=0, description="Per-match SOT from API-Football")
+    corners: float | None = Field(default=None, ge=0, description="Per-match corners from API-Football")
     isolated_away_xga: float | None = Field(
         default=None,
         ge=0,
@@ -240,3 +243,31 @@ class LeaguePerformanceSummary(BaseModel):
     sources: list[SourcePerformance]
     best_source: str
     consensus_accuracy: float
+
+
+class ParseSlipRequest(BaseModel):
+    image_base64: str = Field(
+        min_length=10,
+        description="Bet slip screenshot as data:image/png;base64,... or raw base64",
+    )
+    user_id: str = Field(min_length=1, description="Supabase auth user id for bet_journal RLS scoping")
+
+
+class BetJournalRow(BaseModel):
+    id: str
+    user_id: str
+    match_id: str | None = None
+    match_label: str | None = None
+    outcome: Outcome
+    odds: float
+    stake: float
+    units: float | None = None
+    consensus_prob: float
+    ev_pct: float
+    kelly_pct: float
+    result: Literal["win", "loss", "push", "pending"] = "pending"
+    profit: float | None = None
+    placed_at: datetime | None = None
+    ocr_applied: bool = False
+    ocr_market: str | None = None
+    ocr_bookmaker: str | None = None

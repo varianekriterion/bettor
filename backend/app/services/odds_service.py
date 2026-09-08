@@ -1,4 +1,4 @@
-"""The-Odds-API client with live h2h + totals (O/U) and demo market fallback."""
+"""The-Odds-API client with live h2h + totals (O/U) and optional demo mode."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from app.core.cache import cache_get, cache_set
+from app.core.cache import cache_get_last_good, cache_get_nonempty, cache_set
 from app.core.config import settings
 from app.models.schemas import BookmakerOdds, LEAGUE_META, LeagueKey, MatchOdds, TotalsLine
 
@@ -126,17 +126,33 @@ class OddsApiClient:
         self.api_key = settings.odds_api_key
         self.base_url = settings.odds_api_base_url
 
+    def _stale_odds_or_empty(self, league: LeagueKey, cache_key: str, reason: str) -> list[dict]:
+        """Return last good live snapshot only — never synthetic demo data."""
+        stale = cache_get_last_good(cache_key)
+        if stale is not None:
+            logger.warning("Using last good odds snapshot for %s (%s)", league, reason)
+            return stale
+        return []
+
     async def fetch_league_odds(self, league: LeagueKey) -> list[dict]:
         """Fetch live h2h (1X2) and totals (O/U) odds for an active target league."""
         cache_key = f"odds:{league}"
-        cached = cache_get(cache_key)
+        cached = cache_get_nonempty(cache_key)
         if cached is not None:
             return cached
 
-        if settings.use_demo_data or not self.api_key:
+        if settings.use_demo_data:
             data = self._demo_fixtures(league)
             cache_set(cache_key, data)
             return data
+
+        if not self.api_key:
+            logger.error(
+                "ODDS_API_KEY is not set — cannot fetch live odds for %s. "
+                "Add your key from https://the-odds-api.com to backend/.env",
+                league,
+            )
+            return self._stale_odds_or_empty(cache_key=cache_key, league=league, reason="no API key")
 
         sport_key = LEAGUE_META[league]["odds_api_key"]
         url = f"{self.base_url}/sports/{sport_key}/odds"
@@ -151,13 +167,17 @@ class OddsApiClient:
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 data = resp.json()
-                cache_set(cache_key, data)
-                return data
+                if data:
+                    cache_set(cache_key, data)
+                    return data
+                return self._stale_odds_or_empty(
+                    cache_key=cache_key, league=league, reason="API returned empty"
+                )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Odds API failed for %s: %s — using demo fixtures", league, exc)
-            data = self._demo_fixtures(league)
-            cache_set(cache_key, data)
-            return data
+            logger.warning("Odds API failed for %s: %s", league, exc)
+            return self._stale_odds_or_empty(
+                cache_key=cache_key, league=league, reason=f"API error: {exc}"
+            )
 
     def parse_match_odds(self, event: dict) -> MatchOdds:
         bookmakers: list[BookmakerOdds] = []
@@ -187,7 +207,16 @@ class OddsApiClient:
             )
 
         if not bookmakers:
-            return _demo_odds(event["home_team"], event["away_team"], event.get("sport_key", "demo"))
+            if settings.use_demo_data:
+                return _demo_odds(
+                    event["home_team"],
+                    event["away_team"],
+                    event.get("sport_key", "demo"),
+                )
+            raise ValueError(
+                f"No bookmaker odds for {event.get('home_team')} vs {event.get('away_team')} "
+                "(strict no-demo mode — refusing synthetic odds)"
+            )
 
         totals_books = [b.totals for b in bookmakers if b.totals is not None]
         # Prefer books quoting the preferred line when computing best O/U.

@@ -19,6 +19,18 @@ import numpy as np
 Outcome = Literal["home", "draw", "away"]
 DevigMethod = Literal["multiplicative", "power"]
 
+# ---------------------------------------------------------------------------
+# Quantitative guardrails — extreme longshot / high-variance protection
+# ---------------------------------------------------------------------------
+MAX_ACTIONABLE_ODDS = 7.50
+MIN_ACTIONABLE_PROB = 0.12
+MAX_DISPLAY_EV_PCT = 25.0
+HIGH_ODDS_KELLY_THRESHOLD = 5.00
+HIGH_ODDS_MAX_STAKE_PCT = 0.5  # bankroll cap for odds > 5.00
+LONGSHOT_PRIOR_STRENGTH = 6.0  # market anchor weight when market prob < 0.12
+MODERATE_LONGSHOT_PRIOR_STRENGTH = 3.5  # when market prob in [0.12, 0.20)
+DEFAULT_PRIOR_STRENGTH = 1.5
+
 
 @dataclass(frozen=True)
 class DeviggedOdds:
@@ -98,6 +110,9 @@ class EVResult:
     ev_decimal: float
     is_positive: bool
     fair_odds: float
+    raw_ev_pct: float | None = None
+    is_anomaly: bool = False
+    anomaly_reason: str | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -105,6 +120,9 @@ class EVResult:
             "ev_decimal": self.ev_decimal,
             "is_positive": self.is_positive,
             "fair_odds": self.fair_odds,
+            "raw_ev_pct": self.raw_ev_pct,
+            "is_anomaly": self.is_anomaly,
+            "anomaly_reason": self.anomaly_reason,
         }
 
 
@@ -183,17 +201,38 @@ def devig_odds(
     return multiplicative_devig(home, draw, away)
 
 
+def adaptive_prior_strength(
+    prior: dict[Outcome, float],
+    base: float = DEFAULT_PRIOR_STRENGTH,
+) -> dict[Outcome, float]:
+    """
+    Per-outcome prior weight: extreme longshots get stronger market shrinkage
+    so tipster noise cannot inflate a 1% underdog toward 14%.
+    """
+    strengths: dict[Outcome, float] = {}
+    for outcome in ("home", "draw", "away"):
+        market_p = prior[outcome]
+        if market_p < MIN_ACTIONABLE_PROB:
+            strengths[outcome] = LONGSHOT_PRIOR_STRENGTH
+        elif market_p < 0.20:
+            strengths[outcome] = MODERATE_LONGSHOT_PRIOR_STRENGTH
+        else:
+            strengths[outcome] = base
+    return strengths
+
+
 def bayesian_consensus(
     source_probs: dict[str, dict[Outcome, float]],
     source_accuracies: dict[str, float] | None = None,
     prior: dict[Outcome, float] | None = None,
-    prior_strength: float = 1.0,
+    prior_strength: float | dict[Outcome, float] = 1.0,
 ) -> ConsensusResult:
     """
     Performance-weighted consensus with optional Dirichlet-style prior.
 
     Each source contributes probabilities weighted by its rolling accuracy
     (default equal weights). A weak prior (market or flat) stabilizes sparse data.
+    `prior_strength` may be a scalar or per-outcome dict for longshot shrinkage.
     """
     if not source_probs:
         raise ValueError("At least one prediction source is required")
@@ -221,8 +260,13 @@ def bayesian_consensus(
             avg[o] += w * (probs.get(o, 0.0) / total)
 
     # Blend with prior: posterior ∝ prior_strength * prior + weight_sum * avg
+    if isinstance(prior_strength, dict):
+        strengths = {o: float(prior_strength.get(o, 1.0)) for o in outcomes}
+    else:
+        strengths = {o: float(prior_strength) for o in outcomes}
+
     blended = {
-        o: (prior_strength * prior[o] + weight_sum * avg[o]) / (prior_strength + weight_sum)
+        o: (strengths[o] * prior[o] + weight_sum * avg[o]) / (strengths[o] + weight_sum)
         for o in outcomes
     }
     blend_sum = sum(blended.values())
@@ -243,11 +287,27 @@ def bayesian_consensus(
     )
 
 
+def qualifies_for_positive_ev(probability: float, decimal_odds: float, raw_ev_pct: float) -> bool:
+    """Actionable +EV requires realistic odds, probability, and EV magnitude."""
+    if raw_ev_pct <= 0:
+        return False
+    if decimal_odds > MAX_ACTIONABLE_ODDS:
+        return False
+    if probability < MIN_ACTIONABLE_PROB:
+        return False
+    if raw_ev_pct > MAX_DISPLAY_EV_PCT:
+        return False
+    return True
+
+
 def expected_value(probability: float, decimal_odds: float) -> EVResult:
     """
     EV% = (p * (odds - 1) - (1 - p)) * 100
 
     Equivalent to: (p * odds - 1) * 100
+
+    Applies longshot guardrails: extreme odds/probability combinations and
+    raw EV > 25% are excluded from actionable +EV and flagged as anomalies.
     """
     if not 0.0 <= probability <= 1.0:
         raise ValueError("Probability must be in [0, 1]")
@@ -258,14 +318,25 @@ def expected_value(probability: float, decimal_odds: float) -> EVResult:
     b = decimal_odds - 1.0
     q = 1.0 - p
     ev_decimal = p * b - q
-    ev_pct = ev_decimal * 100.0
+    raw_ev_pct = ev_decimal * 100.0
     fair_odds = (1.0 / p) if p > 0 else float("inf")
 
+    is_anomaly = raw_ev_pct > MAX_DISPLAY_EV_PCT
+    anomaly_reason: str | None = None
+    if is_anomaly:
+        anomaly_reason = "High-Variance Outlier / Anomaly"
+
+    is_positive = qualifies_for_positive_ev(p, decimal_odds, raw_ev_pct)
+    display_ev_pct = min(raw_ev_pct, MAX_DISPLAY_EV_PCT) if is_anomaly else raw_ev_pct
+
     return EVResult(
-        ev_pct=round(ev_pct, 4),
+        ev_pct=round(display_ev_pct, 4),
         ev_decimal=round(ev_decimal, 6),
-        is_positive=ev_pct > 0,
+        is_positive=is_positive,
         fair_odds=round(fair_odds, 4),
+        raw_ev_pct=round(raw_ev_pct, 4),
+        is_anomaly=is_anomaly,
+        anomaly_reason=anomaly_reason,
     )
 
 
@@ -280,6 +351,8 @@ def kelly_criterion(
     where b = decimal_odds - 1, q = 1 - p.
 
     Applies fractional Kelly (default Quarter-Kelly) as a drawdown safeguard.
+    For odds > 5.00, uses Eighth-Kelly (half the fraction) and caps stake at
+    0.5% of bankroll to limit depletion on high-variance outcomes.
     Negative edge yields zero stake.
     """
     if not 0.0 <= probability <= 1.0:
@@ -289,21 +362,27 @@ def kelly_criterion(
     if not 0.0 < fraction <= 1.0:
         raise ValueError("Kelly fraction must be in (0, 1]")
 
+    effective_fraction = fraction / 2.0 if decimal_odds > HIGH_ODDS_KELLY_THRESHOLD else fraction
+
     p = probability
     q = 1.0 - p
     b = decimal_odds - 1.0
     edge = b * p - q
     full = edge / b if b > 0 else 0.0
     full = max(0.0, full)  # never recommend a negative stake
-    frac = full * fraction
+    frac = full * effective_fraction
+    stake_pct = frac * 100.0
+    if decimal_odds > HIGH_ODDS_KELLY_THRESHOLD and stake_pct > HIGH_ODDS_MAX_STAKE_PCT:
+        stake_pct = HIGH_ODDS_MAX_STAKE_PCT
+        frac = stake_pct / 100.0
     stake_amount = (bankroll * frac) if bankroll is not None and bankroll > 0 else None
 
     return KellyResult(
         full_kelly=round(full, 6),
         fractional_kelly=round(frac, 6),
-        fraction_used=fraction,
+        fraction_used=effective_fraction,
         edge=round(edge, 6),
-        recommended_stake_pct=round(frac * 100.0, 4),
+        recommended_stake_pct=round(stake_pct, 4),
         recommended_stake_amount=round(stake_amount, 2) if stake_amount is not None else None,
     )
 
@@ -351,7 +430,16 @@ def compute_match_edges(
             "btts_penalty_applied": penalized,
         }
 
-    best = max(edges.items(), key=lambda kv: kv[1]["ev"]["ev_pct"])
+    actionable = {k: v for k, v in edges.items() if v["ev"]["is_positive"]}
+    eligible = {
+        k: v
+        for k, v in edges.items()
+        if v["odds"] <= MAX_ACTIONABLE_ODDS
+        and v["probability"] >= MIN_ACTIONABLE_PROB
+        and not v["ev"].get("is_anomaly", False)
+    }
+    pool = actionable or eligible or edges
+    best = max(pool.items(), key=lambda kv: kv[1]["ev"]["ev_pct"])
     return {
         "consensus": consensus.as_dict(),
         "devigged": fair.as_dict(),
@@ -401,12 +489,10 @@ def calculate_attacking_pressure(
     """
     Composite "attacking pressure" score from shot & set-piece volume.
 
-    Currently fed simulated per-fixture data (see
-    `app.services.understat_service._seeded_xg`, which already generates a
-    plausible shots-on-target/corners pair per fixture in demo mode) — it's
-    written to take a real per-90 trailing-average payload from a stats
-    provider (e.g. FootyStats) as a drop-in replacement for the two inputs;
-    nothing else about the call site needs to change.
+    Inputs are per-match season averages from API-Football via
+    `app.services.stats_service.get_team_stats`, attached to each side's
+    `XGStats` in `understat_service.get_fixture_xg`. When the API key is
+    missing or quota is exhausted, league-average baselines are used instead.
 
     Each input is expressed as a percentage of a league-average baseline
     (`*_baseline`, tune per league/season), weighted, and summed — so 100 =

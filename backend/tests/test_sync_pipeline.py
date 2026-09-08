@@ -35,6 +35,7 @@ async def test_scrape_all_sources_demo_returns_predictions(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_league_predictions_demo(monkeypatch):
+    monkeypatch.setattr("app.core.config.settings.use_demo_data", True)
     monkeypatch.setattr("app.services.sync_service.is_supabase_configured", lambda: False)
     result = await sync_league_predictions(leagues=["epl"], trigger="test")
     assert result.trigger == "test"

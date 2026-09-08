@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { IBM_Plex_Sans, IBM_Plex_Mono, Syne } from "next/font/google";
 import { AppShell } from "@/components/layout/app-shell";
 import { QueryProvider } from "@/components/providers/query-provider";
+import { AuthProvider } from "@/contexts/auth-context";
 import "./globals.css";
 
 const syne = Syne({
@@ -39,7 +40,9 @@ export default function RootLayout({
         className={`${syne.variable} ${plexSans.variable} ${plexMono.variable} antialiased`}
       >
         <QueryProvider>
-          <AppShell>{children}</AppShell>
+          <AuthProvider>
+            <AppShell>{children}</AppShell>
+          </AuthProvider>
         </QueryProvider>
       </body>
     </html>

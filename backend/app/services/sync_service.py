@@ -126,7 +126,7 @@ async def sync_league_predictions(
                 events = await odds_client.fetch_league_odds(league)
                 for event in events:
                     try:
-                        card = await build_match_card(event, league)
+                        card = await build_match_card(event, league, scrape_predictions=True)
                         league_result.matches += 1
                         league_result.predictions += len(card.predictions)
                         # 5 scrapers max; gap = skipped/failed sources

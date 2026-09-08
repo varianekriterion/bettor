@@ -18,6 +18,12 @@ from app.scrapers.errors import ScraperBlockedError, ScraperError
 
 logger = logging.getLogger(__name__)
 
+
+def strict_no_demo_mode() -> bool:
+    """When True, scrapers must never synthesize fallback predictions."""
+    return not settings.use_demo_data
+
+
 _CAPTCHA_MARKERS = (
     "captcha",
     "cf-challenge",
@@ -149,17 +155,22 @@ class BasePredictionScraper(ABC):
         away_team: str,
         league: str,
     ) -> SourcePrediction | None:
-        """Never raise — log and skip this source so consensus can continue."""
+        """Never raise — log and skip this source so consensus can continue.
+
+        In strict no-demo mode (`USE_DEMO_DATA=false`), blocked/failed scrapes
+        always return None — never seeded demo predictions.
+        """
         try:
             return await self.scrape_match(home_team, away_team, league)
         except ScraperBlockedError as exc:
             logger.warning(
-                "Skipping %s for %s vs %s (%s): %s",
+                "Skipping %s for %s vs %s (%s): %s%s",
                 self.source_name,
                 home_team,
                 away_team,
                 league,
                 exc,
+                " (strict no-demo — no synthetic fallback)" if strict_no_demo_mode() else "",
             )
             return None
         except ScraperError as exc:

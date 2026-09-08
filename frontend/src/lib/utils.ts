@@ -22,10 +22,30 @@ export function formatEv(evPct: number): string {
   return `${sign}${evPct.toFixed(1)}%`;
 }
 
+export type BankrollCurrency = "USD" | "MYR" | "SOL" | "ETH";
+
+export const BANKROLL_CURRENCIES: Record<
+  BankrollCurrency,
+  { label: string; symbol: string; decimals: number; step: number }
+> = {
+  USD: { label: "USD", symbol: "$", decimals: 2, step: 10 },
+  MYR: { label: "MYR", symbol: "RM", decimals: 2, step: 10 },
+  SOL: { label: "Sol", symbol: "◎", decimals: 4, step: 0.1 },
+  ETH: { label: "Eth", symbol: "Ξ", decimals: 4, step: 0.01 },
+};
+
 export function formatCurrency(amount: number, currency = "€"): string {
   return `${currency}${amount.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
+  })}`;
+}
+
+export function formatBankroll(amount: number, currency: BankrollCurrency): string {
+  const { symbol, decimals } = BANKROLL_CURRENCIES[currency];
+  return `${symbol}${amount.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
   })}`;
 }
 

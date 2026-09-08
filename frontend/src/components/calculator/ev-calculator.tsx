@@ -2,7 +2,12 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useCalculator } from "@/hooks/use-betting-data";
-import { formatCurrency, formatEv } from "@/lib/utils";
+import {
+  BANKROLL_CURRENCIES,
+  formatBankroll,
+  formatEv,
+  type BankrollCurrency,
+} from "@/lib/utils";
 import type { CalculatorRequest, CalculatorResponse } from "@/types/betting";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,6 +45,7 @@ function localCalculate(input: CalculatorRequest): CalculatorResponse {
 
 export function EvCalculator() {
   const [bankroll, setBankroll] = useState(1000);
+  const [currency, setCurrency] = useState<BankrollCurrency>("USD");
   const [odds, setOdds] = useState(2.1);
   const [prob, setProb] = useState(0.52);
   const [kellyFraction, setKellyFraction] = useState(0.25);
@@ -98,13 +104,31 @@ export function EvCalculator() {
           </CardHeader>
           <CardContent className="space-y-4">
             <Field label="Bankroll">
-              <Input
-                type="number"
-                min={1}
-                step={10}
-                value={bankroll}
-                onChange={(e) => setBankroll(Number(e.target.value))}
-              />
+              <div className="mb-2 flex gap-2">
+                {(Object.keys(BANKROLL_CURRENCIES) as BankrollCurrency[]).map((c) => (
+                  <Button
+                    key={c}
+                    size="sm"
+                    variant={currency === c ? "default" : "secondary"}
+                    onClick={() => setCurrency(c)}
+                  >
+                    {BANKROLL_CURRENCIES[c].label}
+                  </Button>
+                ))}
+              </div>
+              <div className="relative">
+                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-zinc-500">
+                  {BANKROLL_CURRENCIES[currency].symbol}
+                </span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={BANKROLL_CURRENCIES[currency].step}
+                  value={bankroll}
+                  onChange={(e) => setBankroll(Number(e.target.value))}
+                  className="pl-8"
+                />
+              </div>
             </Field>
             <Field label="Decimal odds">
               <Input
@@ -176,7 +200,7 @@ export function EvCalculator() {
                 </div>
                 <Metric
                   label="Recommended stake"
-                  value={formatCurrency(result.recommended_stake)}
+                  value={formatBankroll(result.recommended_stake, currency)}
                   highlight
                 />
                 <Metric
@@ -189,7 +213,7 @@ export function EvCalculator() {
                 />
                 <Metric
                   label="Expected profit on stake"
-                  value={formatCurrency(result.expected_return)}
+                  value={formatBankroll(result.expected_return, currency)}
                 />
                 <Metric label="Fair odds" value={result.fair_odds.toFixed(3)} />
                 <Metric label="Edge (b·p − q)" value={result.edge.toFixed(4)} />

@@ -33,12 +33,11 @@ async function ensureProfile(userId: string, displayName?: string | null) {
     { onConflict: "id" }
   );
   if (error) {
-    // Trigger may have already created the row; ignore unique conflicts.
     console.debug("ensureProfile:", error.message);
   }
 }
 
-/** Ensure a session exists for RLS-backed journal writes (anonymous if enabled). */
+/** Return the current signed-in user id for journal/OCR writes. */
 export async function ensureJournalSession(): Promise<{
   userId: string | null;
   mode: "supabase" | "local";
@@ -62,17 +61,9 @@ export async function ensureJournalSession(): Promise<{
     return { userId: existing.session.user.id, mode: "supabase" };
   }
 
-  const { data, error } = await supabase.auth.signInAnonymously();
-  if (error || !data.user) {
-    return {
-      userId: null,
-      mode: "local",
-      message:
-        error?.message ||
-        "Anonymous auth unavailable — enable it in Supabase Auth, or sign in. Journal falls back to local storage.",
-    };
-  }
-
-  await ensureProfile(data.user.id, "Anonymous");
-  return { userId: data.user.id, mode: "supabase" };
+  return {
+    userId: null,
+    mode: "local",
+    message: "Sign in or create an account to sync your bet journal to Supabase.",
+  };
 }

@@ -2,73 +2,165 @@
 
 from __future__ import annotations
 
+import logging
+import time
+
 from app.models.schemas import (
     LEAGUE_META,
     LeagueKey,
     LeaguePerformanceSummary,
     SourcePerformance,
 )
+from app.services.supabase_store import get_supabase_client, is_supabase_configured
 
-# Seeded rolling performance — replace with Supabase queries in production
-_PERFORMANCE_SEED: dict[str, dict[str, dict[str, float | int]]] = {
-    "epl": {
-        "forebet": {"total": 86, "correct": 48, "brier": 0.214, "ev": 2.4, "d30": 0.56},
-        "predictz": {"total": 90, "correct": 46, "brier": 0.228, "ev": 1.1, "d30": 0.51},
-        "windrawwin": {"total": 78, "correct": 39, "brier": 0.241, "ev": 0.4, "d30": 0.48},
-        "betimate": {"total": 84, "correct": 47, "brier": 0.209, "ev": 3.1, "d30": 0.57},
-        "footballwhispers": {"total": 72, "correct": 35, "brier": 0.236, "ev": 0.8, "d30": 0.49},
-        "consensus": {"total": 90, "correct": 52, "brier": 0.198, "ev": 4.2, "d30": 0.59},
-    },
-    "laliga": {
-        "forebet": {"total": 70, "correct": 39, "brier": 0.221, "ev": 1.8, "d30": 0.54},
-        "predictz": {"total": 74, "correct": 38, "brier": 0.233, "ev": 0.9, "d30": 0.50},
-        "windrawwin": {"total": 66, "correct": 32, "brier": 0.245, "ev": 0.2, "d30": 0.47},
-        "betimate": {"total": 68, "correct": 37, "brier": 0.218, "ev": 2.2, "d30": 0.55},
-        "footballwhispers": {"total": 60, "correct": 29, "brier": 0.240, "ev": 0.5, "d30": 0.48},
-        "consensus": {"total": 74, "correct": 42, "brier": 0.205, "ev": 3.6, "d30": 0.57},
-    },
-    "bundesliga": {
-        "forebet": {"total": 64, "correct": 36, "brier": 0.217, "ev": 2.0, "d30": 0.55},
-        "predictz": {"total": 66, "correct": 34, "brier": 0.230, "ev": 1.0, "d30": 0.52},
-        "windrawwin": {"total": 58, "correct": 28, "brier": 0.248, "ev": -0.1, "d30": 0.46},
-        "betimate": {"total": 62, "correct": 35, "brier": 0.211, "ev": 2.8, "d30": 0.58},
-        "footballwhispers": {"total": 54, "correct": 26, "brier": 0.239, "ev": 0.6, "d30": 0.49},
-        "consensus": {"total": 66, "correct": 39, "brier": 0.201, "ev": 3.9, "d30": 0.60},
-    },
-    "seriea": {
-        "forebet": {"total": 68, "correct": 37, "brier": 0.223, "ev": 1.6, "d30": 0.53},
-        "predictz": {"total": 72, "correct": 36, "brier": 0.234, "ev": 0.7, "d30": 0.49},
-        "windrawwin": {"total": 64, "correct": 31, "brier": 0.244, "ev": 0.3, "d30": 0.47},
-        "betimate": {"total": 70, "correct": 39, "brier": 0.215, "ev": 2.5, "d30": 0.56},
-        "footballwhispers": {"total": 58, "correct": 28, "brier": 0.237, "ev": 0.9, "d30": 0.50},
-        "consensus": {"total": 72, "correct": 41, "brier": 0.207, "ev": 3.4, "d30": 0.58},
-    },
-    "ucl": {
-        "forebet": {"total": 42, "correct": 24, "brier": 0.208, "ev": 2.9, "d30": 0.58},
-        "predictz": {"total": 44, "correct": 23, "brier": 0.220, "ev": 1.4, "d30": 0.53},
-        "windrawwin": {"total": 38, "correct": 19, "brier": 0.235, "ev": 0.5, "d30": 0.50},
-        "betimate": {"total": 40, "correct": 23, "brier": 0.205, "ev": 3.4, "d30": 0.59},
-        "footballwhispers": {"total": 36, "correct": 18, "brier": 0.229, "ev": 1.0, "d30": 0.51},
-        "consensus": {"total": 44, "correct": 26, "brier": 0.192, "ev": 4.8, "d30": 0.62},
-    },
-    "uel": {
-        "forebet": {"total": 40, "correct": 21, "brier": 0.226, "ev": 1.5, "d30": 0.52},
-        "predictz": {"total": 42, "correct": 20, "brier": 0.238, "ev": 0.6, "d30": 0.48},
-        "windrawwin": {"total": 36, "correct": 17, "brier": 0.249, "ev": 0.0, "d30": 0.45},
-        "betimate": {"total": 38, "correct": 20, "brier": 0.222, "ev": 1.9, "d30": 0.54},
-        "footballwhispers": {"total": 34, "correct": 16, "brier": 0.242, "ev": 0.4, "d30": 0.47},
-        "consensus": {"total": 42, "correct": 23, "brier": 0.210, "ev": 3.1, "d30": 0.56},
-    },
-}
+logger = logging.getLogger(__name__)
+
+DEFAULT_ACCURACY_PRIOR = 0.50
+DEFAULT_BRIER_PRIOR = 0.25
+_ACTIVE_LEAGUES: list[str] = list(LEAGUE_META.keys())
+
+_perf_cache: dict[str, dict[str, dict[str, float | int]]] | None = None
+_perf_cache_at: float = 0.0
+_PERF_CACHE_TTL_SECONDS = 300
+
+
+def invalidate_performance_cache() -> None:
+    global _perf_cache, _perf_cache_at
+    _perf_cache = None
+    _perf_cache_at = 0.0
+
+
+def _empty_league_stats() -> dict[str, dict[str, float | int]]:
+    return {}
+
+
+def _load_tipster_performance() -> dict[str, dict[str, dict[str, float | int]]]:
+    """Return {league: {source: {total, won, win_rate, brier}}}."""
+    global _perf_cache, _perf_cache_at
+
+    now = time.monotonic()
+    if _perf_cache is not None and (now - _perf_cache_at) < _PERF_CACHE_TTL_SECONDS:
+        return _perf_cache
+
+    by_league: dict[str, dict[str, dict[str, float | int]]] = {
+        league: _empty_league_stats() for league in _ACTIVE_LEAGUES
+    }
+
+    if not is_supabase_configured():
+        _perf_cache = by_league
+        _perf_cache_at = now
+        return by_league
+
+    client = get_supabase_client()
+    if client is None:
+        _perf_cache = by_league
+        _perf_cache_at = now
+        return by_league
+
+    try:
+        resp = client.table("tipster_performance").select("*").execute()
+        for row in resp.data or []:
+            league = row.get("league")
+            source = row.get("source")
+            if not league or not source:
+                continue
+            bucket = by_league.setdefault(league, _empty_league_stats())
+            total = int(row.get("total_picks") or 0)
+            won = int(row.get("won_picks") or 0)
+            bucket[source] = {
+                "total": total,
+                "won": won,
+                "d30": float(row.get("win_rate") or DEFAULT_ACCURACY_PRIOR),
+                "brier": float(row.get("brier_score") or DEFAULT_BRIER_PRIOR),
+                "ev": 0.0,
+            }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load tipster_performance: %s", exc)
+
+    _perf_cache = by_league
+    _perf_cache_at = now
+    return by_league
+
+
+def _consensus_stats_from_db(league: LeagueKey) -> dict[str, float | int] | None:
+    """Best-effort consensus rollup from settled consensus_runs (last 30 days)."""
+    if not is_supabase_configured():
+        return None
+
+    client = get_supabase_client()
+    if client is None:
+        return None
+
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    try:
+        resp = (
+            client.table("consensus_runs")
+            .select("pick, matches!inner(league_key, result_outcome, commence_time, status)")
+            .eq("matches.league_key", league)
+            .eq("matches.status", "finished")
+            .gte("matches.commence_time", since)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("consensus rollup unavailable for %s: %s", league, exc)
+        return None
+
+    rows = resp.data or []
+    if not rows:
+        return None
+
+    total = 0
+    correct = 0
+    for row in rows:
+        match = row.get("matches") or {}
+        outcome = match.get("result_outcome")
+        if not outcome:
+            continue
+        total += 1
+        if row.get("pick") == outcome:
+            correct += 1
+
+    if total == 0:
+        return None
+
+    accuracy = correct / total
+    return {
+        "total": total,
+        "correct": correct,
+        "brier": DEFAULT_BRIER_PRIOR,
+        "ev": 0.0,
+        "d30": round(accuracy, 4),
+    }
 
 
 def get_source_accuracies(league: LeagueKey) -> dict[str, float]:
     """Return last-30-day accuracy weights for Bayesian consensus."""
-    league_data = _PERFORMANCE_SEED.get(league, {})
+    league_data = _load_tipster_performance().get(league, {})
+    if not league_data:
+        return {}
+
     return {
-        source: float(stats["d30"])
+        source: float(stats.get("d30", DEFAULT_ACCURACY_PRIOR))
         for source, stats in league_data.items()
         if source != "consensus"
+    }
+
+
+def _stats_for_source(
+    league: str,
+    source: str,
+    stats: dict[str, float | int] | None,
+) -> dict[str, float | int]:
+    if stats:
+        return stats
+    return {
+        "total": 0,
+        "won": 0,
+        "d30": DEFAULT_ACCURACY_PRIOR,
+        "brier": DEFAULT_BRIER_PRIOR,
+        "ev": 0.0,
     }
 
 
@@ -78,28 +170,29 @@ def _to_source_performance(
     stats: dict[str, float | int],
     rank: int | None = None,
 ) -> SourcePerformance:
-    total = int(stats["total"])
-    correct = int(stats["correct"])
-    accuracy = correct / total if total else 0.0
+    total = int(stats.get("total", 0))
+    won = int(stats.get("won", stats.get("correct", 0)))
+    accuracy = won / total if total else DEFAULT_ACCURACY_PRIOR
     return SourcePerformance(
         source=source,
         league=league,
         total_predictions=total,
-        correct=correct,
+        correct=won,
         accuracy=round(accuracy, 4),
-        brier_score=float(stats["brier"]),
-        avg_ev_captured=float(stats["ev"]),
-        last_30_days_accuracy=float(stats["d30"]),
+        brier_score=float(stats.get("brier", DEFAULT_BRIER_PRIOR)),
+        avg_ev_captured=float(stats.get("ev", 0.0)),
+        last_30_days_accuracy=float(stats.get("d30", DEFAULT_ACCURACY_PRIOR)),
         rank=rank,
     )
 
 
 def get_league_performance(league: LeagueKey | None = None) -> list[LeaguePerformanceSummary]:
-    leagues: list[str] = [league] if league else list(_PERFORMANCE_SEED.keys())
+    performance = _load_tipster_performance()
+    leagues: list[str] = [league] if league else list(_ACTIVE_LEAGUES)
     summaries: list[LeaguePerformanceSummary] = []
 
     for lg in leagues:
-        data = _PERFORMANCE_SEED.get(lg, {})
+        data = performance.get(lg, {})
         source_rows = [
             _to_source_performance(src, lg, stats)
             for src, stats in data.items()
@@ -109,8 +202,17 @@ def get_league_performance(league: LeagueKey | None = None) -> list[LeaguePerfor
         for i, row in enumerate(source_rows, start=1):
             row.rank = i
 
-        consensus_stats = data.get("consensus", {"total": 0, "correct": 0, "brier": 0.25, "ev": 0, "d30": 0.33})
-        consensus_acc = float(consensus_stats["d30"])
+        consensus_stats = data.get("consensus") or _consensus_stats_from_db(lg)  # type: ignore[arg-type]
+        if consensus_stats:
+            consensus_acc = float(consensus_stats.get("d30", DEFAULT_ACCURACY_PRIOR))
+        elif source_rows:
+            consensus_acc = round(
+                sum(r.last_30_days_accuracy for r in source_rows) / len(source_rows),
+                4,
+            )
+        else:
+            consensus_acc = DEFAULT_ACCURACY_PRIOR
+
         best = source_rows[0].source if source_rows else "n/a"
 
         summaries.append(
@@ -127,37 +229,48 @@ def get_league_performance(league: LeagueKey | None = None) -> list[LeaguePerfor
 
 def get_global_leaderboard() -> list[SourcePerformance]:
     """Aggregate accuracy across all leagues for a global source ranking."""
+    performance = _load_tipster_performance()
     aggregates: dict[str, dict[str, float]] = {}
-    for league, sources in _PERFORMANCE_SEED.items():
+
+    for league, sources in performance.items():
         for source, stats in sources.items():
             if source == "consensus":
                 continue
             bucket = aggregates.setdefault(
                 source,
-                {"total": 0, "correct": 0, "brier": 0.0, "ev": 0.0, "d30": 0.0, "n": 0},
+                {"total": 0, "won": 0, "brier": 0.0, "ev": 0.0, "d30": 0.0, "n": 0},
             )
-            bucket["total"] += float(stats["total"])
-            bucket["correct"] += float(stats["correct"])
-            bucket["brier"] += float(stats["brier"])
-            bucket["ev"] += float(stats["ev"])
-            bucket["d30"] += float(stats["d30"])
-            bucket["n"] += 1
+            total = int(stats.get("total", 0))
+            won = int(stats.get("won", 0))
+            bucket["total"] += total
+            bucket["won"] += won
+            if total > 0:
+                bucket["brier"] += float(stats.get("brier", DEFAULT_BRIER_PRIOR))
+                bucket["ev"] += float(stats.get("ev", 0.0))
+                bucket["d30"] += float(stats.get("d30", DEFAULT_ACCURACY_PRIOR))
+                bucket["n"] += 1
 
     rows: list[SourcePerformance] = []
     for source, agg in aggregates.items():
         n = max(agg["n"], 1)
+        total = int(agg["total"])
+        won = int(agg["won"])
         rows.append(
             SourcePerformance(
                 source=source,
                 league="all",
-                total_predictions=int(agg["total"]),
-                correct=int(agg["correct"]),
-                accuracy=round(agg["correct"] / agg["total"], 4) if agg["total"] else 0.0,
-                brier_score=round(agg["brier"] / n, 4),
-                avg_ev_captured=round(agg["ev"] / n, 2),
-                last_30_days_accuracy=round(agg["d30"] / n, 4),
+                total_predictions=total,
+                correct=won,
+                accuracy=round(won / total, 4) if total else DEFAULT_ACCURACY_PRIOR,
+                brier_score=round(agg["brier"] / n, 4) if agg["n"] else DEFAULT_BRIER_PRIOR,
+                avg_ev_captured=round(agg["ev"] / n, 2) if agg["n"] else 0.0,
+                last_30_days_accuracy=round(agg["d30"] / n, 4) if agg["n"] else DEFAULT_ACCURACY_PRIOR,
             )
         )
+
+    if not rows:
+        return []
+
     rows.sort(key=lambda r: r.last_30_days_accuracy, reverse=True)
     for i, row in enumerate(rows, start=1):
         row.rank = i

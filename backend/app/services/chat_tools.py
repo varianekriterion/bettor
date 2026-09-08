@@ -40,6 +40,11 @@ async def _query_xg_stats(
     home_team: str, away_team: str, league: str, season: str | None = None
 ) -> str:
     stats = await understat_service.get_fixture_xg(home_team, away_team, league, season)
+    if stats is None:
+        return (
+            f"No live xG data available for {home_team} vs {away_team} ({league}). "
+            "Understat does not cover UCL/UEL, or the lookup failed in strict no-demo mode."
+        )
     caveat = (
         ""
         if stats.home.source == "understat"

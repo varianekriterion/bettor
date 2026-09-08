@@ -33,6 +33,7 @@ to demo data rather than crashing the pipeline (same philosophy as
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import logging
@@ -42,6 +43,7 @@ from typing import Any
 from app.core.cache import cache_get, cache_set
 from app.core.config import settings
 from app.models.schemas import FixtureXGStats, LeagueKey, XGStats
+from app.services.stats_service import LEAGUE_BASELINES, get_team_stats
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     "newcastle": "Newcastle United",
     "nottingham forest": "Nottingham Forest",
     "brighton": "Brighton",
+    "brighton and hove albion": "Brighton",
     "atletico madrid": "Atletico Madrid",
     "real sociedad": "Real Sociedad",
     "bayern munich": "Bayern Munich",
@@ -75,17 +78,35 @@ TEAM_NAME_ALIASES: dict[str, str] = {
 }
 
 
+def _league_pressure_defaults(league: str) -> tuple[float, float]:
+    base = LEAGUE_BASELINES.get(league, LEAGUE_BASELINES.get("epl", {}))
+    return base.get("shots_on_target", 4.5), base.get("corners", 5.0)
+
+
+async def _attach_pressure_metrics(stats: XGStats, team: str, league: str) -> XGStats:
+    """Enrich xG profile with API-Football shots/corners (or league baselines)."""
+    live = await get_team_stats(team, league=league)
+    return stats.model_copy(
+        update={
+            "shots_on_target": live.shots_on_target_per_match,
+            "corners": live.corners_per_match,
+        }
+    )
+
+
 def _seeded_xg(team: str, opponent: str, league: str, *, is_away: bool = False) -> XGStats:
     """
     Deterministic pseudo-xG for demo mode, unsupported leagues (UCL/UEL), or
     when a live Understat lookup fails/can't be matched. Stable across
     restarts, same spirit as `app.scrapers.prediction_sites._seeded_probs`.
+
+    Shots/corners are filled later via `_attach_pressure_metrics` (API-Football
+    or league baselines) — not seeded here.
     """
     digest = hashlib.sha256(f"xg|{league}|{team}|{opponent}".encode()).hexdigest()
     xg = 0.9 + (int(digest[0:2], 16) / 255.0) * 1.6       # ~0.9-2.5
     xga = 0.7 + (int(digest[2:4], 16) / 255.0) * 1.5      # ~0.7-2.2
-    sot = 2.5 + (int(digest[4:6], 16) / 255.0) * 4.0      # ~2.5-6.5
-    corners = 3.0 + (int(digest[6:8], 16) / 255.0) * 5.0  # ~3.0-8.0
+    sot_default, corners_default = _league_pressure_defaults(league)
     isolated_away_xga = None
     if is_away:
         # A correlated-but-distinct seed so it isn't identical to overall xga.
@@ -95,8 +116,8 @@ def _seeded_xg(team: str, opponent: str, league: str, *, is_away: bool = False) 
         team=team,
         xg=round(xg, 2),
         xga=round(xga, 2),
-        shots_on_target=round(sot, 1),
-        corners=round(corners, 1),
+        shots_on_target=sot_default,
+        corners=corners_default,
         isolated_away_xga=isolated_away_xga,
         matches_sampled=1,
         source="demo",
@@ -162,6 +183,38 @@ def _average_form(
     return xg_for_total / n, xga_total / n
 
 
+async def _get_league_team_titles(
+    client: Any,
+    understat_league: str,
+    season: str,
+) -> list[str]:
+    cache_key = f"understat:teams:{understat_league}:{season}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    teams = await client.get_teams(understat_league, season)
+    titles = [t.get("title", "") for t in teams if t.get("title")]
+    cache_set(cache_key, titles)
+    return titles
+
+
+async def _get_team_completed_rows(
+    client: Any,
+    understat_league: str,
+    team_title: str,
+    season: str,
+) -> list[dict[str, Any]]:
+    cache_key = f"understat:results:{understat_league}:{season}:{team_title}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows = [r for r in await client.get_team_results(team_title, season) if _row_is_completed(r)]
+    cache_set(cache_key, rows)
+    return rows
+
+
 async def _fetch_live(
     home_team: str,
     away_team: str,
@@ -181,8 +234,7 @@ async def _fetch_live(
     try:
         async with aiohttp.ClientSession() as session:
             client = Understat(session)
-            teams = await client.get_teams(understat_league, season)
-            titles = [t.get("title", "") for t in teams if t.get("title")]
+            titles = await _get_league_team_titles(client, understat_league, season)
 
             home_match = _best_team_match(home_team, titles)
             away_match = _best_team_match(away_team, titles)
@@ -197,8 +249,10 @@ async def _fetch_live(
                 )
                 return None
 
-            home_rows = [r for r in await client.get_team_results(home_match, season) if _row_is_completed(r)]
-            away_rows = [r for r in await client.get_team_results(away_match, season) if _row_is_completed(r)]
+            home_rows, away_rows = await asyncio.gather(
+                _get_team_completed_rows(client, understat_league, home_match, season),
+                _get_team_completed_rows(client, understat_league, away_match, season),
+            )
 
             home_form = _average_form(home_rows, home_match, lookback)
             away_form = _average_form(away_rows, away_match, lookback)
@@ -219,22 +273,28 @@ async def _fetch_live(
             away_xg, away_xga = away_form
             isolated_away_xga = away_venue_form[1] if away_venue_form is not None else away_xga
 
+            home_stats = XGStats(
+                team=home_team,
+                xg=round(home_xg, 2),
+                xga=round(home_xga, 2),
+                matches_sampled=min(len(home_rows), lookback) or 1,
+                source="understat",
+            )
+            away_stats = XGStats(
+                team=away_team,
+                xg=round(away_xg, 2),
+                xga=round(away_xga, 2),
+                isolated_away_xga=round(isolated_away_xga, 2),
+                matches_sampled=min(len(away_rows), lookback) or 1,
+                source="understat",
+            )
+            home_stats, away_stats = await asyncio.gather(
+                _attach_pressure_metrics(home_stats, home_team, str(league)),
+                _attach_pressure_metrics(away_stats, away_team, str(league)),
+            )
             return FixtureXGStats(
-                home=XGStats(
-                    team=home_team,
-                    xg=round(home_xg, 2),
-                    xga=round(home_xga, 2),
-                    matches_sampled=min(len(home_rows), lookback) or 1,
-                    source="understat",
-                ),
-                away=XGStats(
-                    team=away_team,
-                    xg=round(away_xg, 2),
-                    xga=round(away_xga, 2),
-                    isolated_away_xga=round(isolated_away_xga, 2),
-                    matches_sampled=min(len(away_rows), lookback) or 1,
-                    source="understat",
-                ),
+                home=home_stats,
+                away=away_stats,
                 league=league,  # type: ignore[arg-type]
                 season=season,
                 fetched_at=datetime.now(timezone.utc),
@@ -256,14 +316,16 @@ async def get_fixture_xg(
     away_team: str,
     league: LeagueKey | str,
     season: str | None = None,
-) -> FixtureXGStats:
+) -> FixtureXGStats | None:
     """
     Return home/away trailing-form xG + xGA ahead of one fixture (plus the
     away side's away-venue-only trailing xGA, for the motivation-flag rule).
 
-    Falls back to deterministic seeded data when: demo mode is on, the
-    league isn't tracked by Understat (ucl/uel), or the live lookup/match
-    fails for any reason — this function itself never raises.
+    Demo mode (`USE_DEMO_DATA=true`): falls back to deterministic seeded data
+    when live lookup fails or the league isn't tracked (ucl/uel).
+
+    Strict mode (`USE_DEMO_DATA=false`): returns None when live Understat
+    data is unavailable — never seeded synthetic xG.
     """
     season = season or settings.understat_season
     cache_key = f"understat:{league}:{home_team}:{away_team}:{season}"
@@ -276,15 +338,24 @@ async def get_fixture_xg(
 
     if understat_league and not settings.use_demo_data:
         result = await _fetch_live(home_team, away_team, league, understat_league, season)
+    elif understat_league and settings.use_demo_data:
+        result = await _fetch_live(home_team, away_team, league, understat_league, season)
 
-    if result is None:
+    if result is None and settings.use_demo_data:
+        home_seed = _seeded_xg(home_team, away_team, str(league))
+        away_seed = _seeded_xg(away_team, home_team, str(league), is_away=True)
+        home_seed, away_seed = await asyncio.gather(
+            _attach_pressure_metrics(home_seed, home_team, str(league)),
+            _attach_pressure_metrics(away_seed, away_team, str(league)),
+        )
         result = FixtureXGStats(
-            home=_seeded_xg(home_team, away_team, str(league)),
-            away=_seeded_xg(away_team, home_team, str(league), is_away=True),
+            home=home_seed,
+            away=away_seed,
             league=league,  # type: ignore[arg-type]
             season=season,
             fetched_at=datetime.now(timezone.utc),
         )
 
-    cache_set(cache_key, result)
+    if result is not None:
+        cache_set(cache_key, result)
     return result
